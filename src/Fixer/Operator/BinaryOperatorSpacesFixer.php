@@ -77,6 +77,20 @@ final class BinaryOperatorSpacesFixer extends AbstractFixer implements Configura
      */
     private $currentLevel;
 
+    /**
+     * The positions for the deepest levels.
+     *
+     * @var array|int[][]
+     */
+    private $positions = [];
+
+    /**
+     * The begin positions of the groups to have the original positions.
+     *
+     * @var array|int[][][]
+     */
+    private $groupPositions = [];
+
     private static $allowedValues = [
         self::ALIGN,
         self::ALIGN_SINGLE_SPACE,
@@ -497,76 +511,142 @@ $h = $i===  $j;
      */
     private function fixAlignment(Tokens $tokens, array $toAlign)
     {
-        $this->deepestLevel = 0;
-        $this->currentLevel = 0;
+        $tokensClone = clone $tokens;
 
-        foreach ($toAlign as $tokenContent => $alignStrategy) {
-            // This fixer works partially on Tokens and partially on string representation of code.
-            // During the process of fixing internal state of single Token may be affected by injecting ALIGN_PLACEHOLDER to its content.
-            // The placeholder will be resolved by `replacePlaceholders` method by removing placeholder or changing it into spaces.
-            // That way of fixing the code causes disturbances in marking Token as changed - if code is perfectly valid then placeholder
-            // still be injected and removed, which will cause the `changed` flag to be set.
-            // To handle that unwanted behavior we work on clone of Tokens collection and then override original collection with fixed collection.
-            $tokensClone = clone $tokens;
+        $arrayStrategy = null;
+        if (isset($toAlign['=>'])) {
+            $this->injectAlignmentPlaceholdersForArrow($tokensClone, 0, count($tokens));
+            $arrayStrategy = $toAlign['=>'];
+            unset($toAlign['=>']);
+        }
 
-            if ('=>' === $tokenContent) {
-                $this->injectAlignmentPlaceholdersForArrow($tokensClone, 0, count($tokens));
-            } else {
-                $this->injectAlignmentPlaceholders($tokensClone, 0, count($tokens), $tokenContent);
-            }
+        $this->injectAlignmentPlaceholders($toAlign, $tokensClone, 0, count($tokens));
 
-            // for all tokens that should be aligned but do not have anything to align with, fix spacing if needed
-            if (self::ALIGN_SINGLE_SPACE === $alignStrategy || self::ALIGN_SINGLE_SPACE_MINIMAL === $alignStrategy) {
-                if ('=>' === $tokenContent) {
-                    for ($index = $tokens->count() - 2; $index > 0; --$index) {
-                        if ($tokens[$index]->isGivenKind(T_DOUBLE_ARROW)) { // always binary operator, never part of declare statement
-                            $this->fixWhiteSpaceBeforeOperator($tokensClone, $index, $alignStrategy);
-                        }
-                    }
-                } elseif ('=' === $tokenContent) {
-                    for ($index = $tokens->count() - 2; $index > 0; --$index) {
-                        if ('=' === $tokens[$index]->getContent() && !$this->isEqualPartOfDeclareStatement($tokens, $index) && $this->tokensAnalyzer->isBinaryOperator($index)) {
-                            $this->fixWhiteSpaceBeforeOperator($tokensClone, $index, $alignStrategy);
-                        }
-                    }
-                } else {
-                    for ($index = $tokens->count() - 2; $index > 0; --$index) {
-                        $content = $tokens[$index]->getContent();
-                        if (strtolower($content) === $tokenContent && $this->tokensAnalyzer->isBinaryOperator($index)) { // never part of declare statement
-                            $this->fixWhiteSpaceBeforeOperator($tokensClone, $index, $alignStrategy);
+        if (!is_null($arrayStrategy)) {
+            $toAlign['=>'] = $arrayStrategy;
+        }
+
+        ksort($this->positions);
+
+        $alignStrategies = [];
+        foreach ($this->positions as $positions) {
+            $positions = array_diff_key($positions, $alignStrategies);
+            if (count($positions) > 0) {
+                foreach ($positions as $groupNumber => $tokenContent) {
+                    if (isset($toAlign[$tokenContent])) {
+                        $alignStrategy = $toAlign[$tokenContent];
+                        $alignStrategies[$groupNumber] = $alignStrategy;
+
+                        // for all tokens that should be aligned but do not have anything to align with,
+                        // fix spacing if needed
+                        if (self::ALIGN_SINGLE_SPACE === $alignStrategy
+                            || self::ALIGN_SINGLE_SPACE_MINIMAL === $alignStrategy
+                        ) {
+                            if ('=>' === $tokenContent) {
+                                for ($index = $tokens->count() - 2; $index > 0; --$index) {
+                                    if ($tokens[$index]->isGivenKind(T_DOUBLE_ARROW)) {
+                                        // always binary operator, never part of declare statement
+                                        $this->fixWhiteSpaceBeforeOperator($tokensClone, $index, $alignStrategy);
+                                    }
+                                }
+                            } elseif ('=' === $tokenContent) {
+                                for ($index = $tokens->count() - 2; $index > 0; --$index) {
+                                    if ('=' === $tokens[$index]->getContent()
+                                        && !$this->isEqualPartOfDeclareStatement($tokens, $index)
+                                        && $this->tokensAnalyzer->isBinaryOperator($index)
+                                    ) {
+                                        $this->fixWhiteSpaceBeforeOperator($tokensClone, $index, $alignStrategy);
+                                    }
+                                }
+                            } else {
+                                for ($index = $tokens->count() - 2; $index > 0; --$index) {
+                                    $content = $tokens[$index]->getContent();
+                                    if (strtolower($content) === $tokenContent && $this->tokensAnalyzer->isBinaryOperator($index)) { // never part of declare statement
+                                        $this->fixWhiteSpaceBeforeOperator($tokensClone, $index, $alignStrategy);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-
-            $tokens->setCode($this->replacePlaceholders($tokensClone, $alignStrategy));
         }
+
+        if (!empty($alignStrategies)) {
+            $tokens->setCode($this->replacePlaceholders($tokensClone, $alignStrategies));
+        }
+        $this->deepestLevel = 0;
+        $this->currentLevel = 0;
+        $this->positions = [];
+        $this->groupPositions = [];
     }
 
     /**
+     * @param array  $toAlign
      * @param Tokens $tokens
      * @param int    $startAt
      * @param int    $endAt
-     * @param string $tokenContent
      */
-    private function injectAlignmentPlaceholders(Tokens $tokens, $startAt, $endAt, $tokenContent)
+    private function injectAlignmentPlaceholders($toAlign, Tokens $tokens, $startAt, $endAt)
     {
+        $lineContent = '';
+        $generatedGroups = [];
+        $beginLevel = $this->deepestLevel;
+        $nextLevel = $beginLevel;
+
         for ($index = $startAt; $index < $endAt; ++$index) {
             $token = $tokens[$index];
 
             $content = $token->getContent();
-            if (
-                strtolower($content) === $tokenContent
-                && $this->tokensAnalyzer->isBinaryOperator($index)
+
+            $lines = explode("\n", $content);
+
+            if (count($lines) > 1) {
+                end($lines);
+                $lineContent = current($lines);
+            } else {
+                $lineContent .= $content;
+            }
+            if ($content === ';') {
+                $nextLevel = $beginLevel;
+            }
+
+            if (isset($toAlign[strtolower($content)])
                 && ('=' !== $content || !$this->isEqualPartOfDeclareStatement($tokens, $index))
             ) {
-                $tokens[$index] = new Token(sprintf(self::ALIGN_PLACEHOLDER, $this->deepestLevel).$content);
+                $lowerContent = strtolower($content);
+                ++$nextLevel;
+                $currentNextLevel = $nextLevel;
+
+                if (!isset($generatedGroups[$currentNextLevel])) {
+                    ++$this->deepestLevel;
+                    $currentNextLevel = $this->deepestLevel;
+                } elseif ($generatedGroups[$currentNextLevel] !== $lowerContent) {
+                    ++$this->deepestLevel;
+                    unset($generatedGroups[$currentNextLevel]);
+                    $currentNextLevel = $this->deepestLevel;
+                }
+
+                $generatedGroups[$currentNextLevel] = $lowerContent;
+
+                $this->addPosition($tokens, $index, strlen($lineContent) - strlen($content), $currentNextLevel);
+
+                $tokens->insertAt(
+                    $index,
+                    new Token(sprintf(self::ALIGN_PLACEHOLDER, $currentNextLevel))
+                );
+
+                ++$index;
+                ++$endAt;
 
                 continue;
             }
 
             if ($token->isGivenKind(T_FUNCTION)) {
                 ++$this->deepestLevel;
+                $beginLevel = $this->deepestLevel;
+                $nextLevel = $beginLevel;
+                $generatedGroups = [];
 
                 continue;
             }
@@ -592,14 +672,63 @@ $h = $i===  $j;
     }
 
     /**
+     * Add an position to the positions.
+     *
+     * @param Tokens $tokens
+     * @param int $index
+     * @param int $position
+     * @param int $level
+     *
+     * @return $this
+     */
+    protected function addPosition($tokens, $index, $position, $level)
+    {
+        $content = $tokens[$index]->getContent();
+
+        for ($positionIndex = $index;
+            !$tokens[$positionIndex]->isGivenKind(T_WHITESPACE);
+            --$positionIndex) {
+            $position -= strlen($tokens[$positionIndex - 1]->getContent());
+        }
+
+        if (!isset($this->groupPositions[$level])) {
+            $this->groupPositions[$level] = [
+                'length' => [],
+                'whitespaceLength' => [],
+            ];
+        }
+        $this->groupPositions[$level]['length'][] = $position;
+        $this->groupPositions[$level]['whitespaceLength'][] = strlen($tokens[$positionIndex]->getContent());
+
+        if (!isset($this->positions[$position])) {
+            $this->positions[$position] = [];
+        }
+        $this->positions[$position][$level] = $content;
+
+        return $this;
+    }
+
+    /**
      * @param Tokens $tokens
      * @param int    $startAt
      * @param int    $endAt
      */
     private function injectAlignmentPlaceholdersForArrow(Tokens $tokens, $startAt, $endAt)
     {
+        $lineContent = '';
         for ($index = $startAt; $index < $endAt; ++$index) {
             $token = $tokens[$index];
+
+            $content = $token->getContent();
+
+            $lines = explode("\n", $content);
+
+            if (count($lines) > 1) {
+                end($lines);
+                $lineContent = current($lines);
+            } else {
+                $lineContent .= $content;
+            }
 
             if ($token->isGivenKind([T_FOREACH, T_FOR, T_WHILE, T_IF, T_SWITCH])) {
                 $index = $tokens->getNextMeaningfulToken($index);
@@ -637,6 +766,8 @@ $h = $i===  $j;
                 } elseif ($nextToken->isWhitespace(" \t")) {
                     $tokens[$index + 1] = new Token([T_WHITESPACE, ' ']);
                 }
+
+                $this->addPosition($tokens, $index, strlen($lineContent) - strlen($content), $this->currentLevel);
 
                 $tokens[$index] = new Token([T_DOUBLE_ARROW, $tokenContent]);
 
@@ -719,15 +850,15 @@ $h = $i===  $j;
      * Look for group of placeholders and provide vertical alignment.
      *
      * @param Tokens $tokens
-     * @param string $alignStrategy
+     * @param array|string[] $alignStrategies
      *
      * @return string
      */
-    private function replacePlaceholders(Tokens $tokens, $alignStrategy)
+    private function replacePlaceholders(Tokens $tokens, array $alignStrategies)
     {
         $tmpCode = $tokens->generateCode();
 
-        for ($j = 0; $j <= $this->deepestLevel; ++$j) {
+        foreach ($alignStrategies as $j => $alignStrategy) {
             $placeholder = sprintf(self::ALIGN_PLACEHOLDER, $j);
 
             if (false === strpos($tmpCode, $placeholder)) {
